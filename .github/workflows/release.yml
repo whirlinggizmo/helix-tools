@@ -1,0 +1,87 @@
+# A tag TOOL-VERSION (spirv-cross-vulkan-sdk-1.4.363.0, glslang-16.6.0) builds that pin of pins.json on each platform it lists, checks
+# each build on smoke/ (build.py), and publishes the zips and their SHA-256s as the tag's release. A pull request or a run by hand builds
+# every pin and publishes nothing. The actions are GitHub's own, pinned to their commits.
+name: release
+
+on:
+  push:
+    tags: ['spirv-cross-*', 'glslang-*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: plan
+        # Each build as {tool, version, platform, runner}: the tag's pin alone, or every pin.
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          pins = json.load(open('pins.json'))
+          runners = {'linux-x86_64': 'ubuntu-22.04', 'linux-arm64': 'ubuntu-22.04-arm', 'macos-universal': 'macos-14',
+                     'windows-x86_64': 'windows-2022'}
+          tag = os.environ['GITHUB_REF_NAME'] if os.environ['GITHUB_REF_TYPE'] == 'tag' else None
+          builds = [{'tool': tool, 'version': version, 'platform': platform, 'runner': runners[platform]}
+                    for tool, versions in pins.items() for version, pin in versions.items() for platform in pin['platforms']
+                    if tag is None or tag == f'{tool}-{version}']
+          if not builds:
+              raise SystemExit(f'{tag} names no pin in pins.json')
+          print('builds=' + json.dumps(builds))
+          EOF
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.builds) }}
+    name: ${{ matrix.tool }} ${{ matrix.version }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: python build.py ${{ matrix.tool }} ${{ matrix.version }} ${{ matrix.platform }} out
+        shell: bash
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.tool }}-${{ matrix.version }}-${{ matrix.platform }}
+          path: out/*.zip
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          sha256sum *.zip > SHA256SUMS
+          python3 - <<'EOF' > notes.md
+          import json, os
+          tag = os.environ['GITHUB_REF_NAME']
+          pin = next(p for tool, versions in json.load(open('../pins.json')).items() for version, p in versions.items()
+                     if tag == f'{tool}-{version}')
+          print(f'Built from {pin["url"]} (SHA-256 {pin["sha256"]}) by this repository\'s workflow, unchanged, its license in each zip.')
+          print('Each build passed build.py\'s smoke check. The zips\' SHA-256s:\n\n```')
+          print(open('SHA256SUMS').read().strip())
+          print('```')
+          EOF
+          gh release create "$GITHUB_REF_NAME" *.zip SHA256SUMS --title "$GITHUB_REF_NAME" --notes-file notes.md
